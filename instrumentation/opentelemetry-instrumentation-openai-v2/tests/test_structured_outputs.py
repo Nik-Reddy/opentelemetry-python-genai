@@ -4,8 +4,12 @@
 """Tests for OpenAI structured outputs (chat.completions.parse) instrumentation."""
 
 import pytest
+from openai import NotFoundError
 from openai.resources.chat.completions import Completions
 
+from opentelemetry.semconv._incubating.attributes import (
+    error_attributes as ErrorAttributes,
+)
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAIAttributes,
 )
@@ -151,3 +155,25 @@ def test_structured_output_no_content(
         assert_message_in_logs(
             logs[1], "gen_ai.choice", choice_event, spans[0]
         )
+
+
+def test_structured_output_404(
+    span_exporter, openai_client, instrument_no_content, vcr
+):
+    latest_experimental_enabled = is_experimental_mode()
+    llm_model_value = "this-model-does-not-exist"
+
+    with vcr.use_cassette("test_structured_output_404.yaml"):
+        with pytest.raises(NotFoundError):
+            openai_client.chat.completions.parse(
+                messages=STRUCTURED_OUTPUT_PROMPT,
+                model=llm_model_value,
+                response_format=CalendarEvent,
+            )
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert_all_attributes(
+        spans[0], llm_model_value, latest_experimental_enabled
+    )
+    assert "NotFoundError" == spans[0].attributes[ErrorAttributes.ERROR_TYPE]
