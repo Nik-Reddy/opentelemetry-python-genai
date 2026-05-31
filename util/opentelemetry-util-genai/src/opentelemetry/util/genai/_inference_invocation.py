@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from opentelemetry._logs import Logger, LogRecord
 from opentelemetry.semconv._incubating.attributes import (
@@ -18,7 +18,6 @@ from opentelemetry.util.genai._invocation import (
     get_content_attributes,
 )
 from opentelemetry.util.genai.completion_hook import CompletionHook
-from opentelemetry.util.genai.metrics import InvocationMetricsRecorder
 from opentelemetry.util.genai.types import (
     InputMessage,
     MessagePart,
@@ -30,8 +29,12 @@ from opentelemetry.util.genai.utils import (
     should_emit_event,
 )
 
+if TYPE_CHECKING:
+    from opentelemetry.util.genai.metrics import InvocationMetricsRecorder
+
 # TODO: Migrate to GenAI constants once available in semconv package
 _GEN_AI_REASONING_OUTPUT_TOKENS = "gen_ai.usage.reasoning.output_tokens"
+_GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK = "gen_ai.response.time_to_first_chunk"
 
 
 class InferenceInvocation(GenAIInvocation):
@@ -93,6 +96,9 @@ class InferenceInvocation(GenAIInvocation):
         self.cache_creation_input_tokens: int | None = None
         self.cache_read_input_tokens: int | None = None
         self.tool_definitions: list[ToolDefinition] | None = None
+        # Streaming timing fields (populated by stream wrappers)
+        self.ttfc_seconds: float | None = None
+        self.chunk_gap_seconds: list[float] = []
         self._start(self._get_base_attributes())
 
     def _get_message_attributes(self, *, for_span: bool) -> dict[str, Any]:
@@ -161,6 +167,10 @@ class InferenceInvocation(GenAIInvocation):
                 _GEN_AI_REASONING_OUTPUT_TOKENS,
                 self.thinking_tokens,
             ),
+            (
+                _GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK,
+                self.ttfc_seconds,
+            ),
         )
         attrs.update({k: v for k, v in optional_attrs if v is not None})
         return attrs
@@ -171,6 +181,29 @@ class InferenceInvocation(GenAIInvocation):
             attrs[GenAI.GEN_AI_RESPONSE_MODEL] = self.response_model_name
         attrs.update(self.metric_attributes)
         return attrs
+
+    def _record_chunk_gap(self, gap: float) -> None:
+        """Buffer a time-per-output-chunk gap (in seconds).
+
+        Called by the stream wrapper as each chunk after the first arrives.
+        Buffered gaps are drained by ``_consume_streaming_timing`` when the
+        invocation stops.
+        """
+        self.chunk_gap_seconds.append(gap)
+
+    def _consume_streaming_timing(
+        self,
+    ) -> tuple[float | None, list[float]]:
+        """Return TTFC and chunk gaps, then reset them on the invocation.
+
+        Called by InvocationMetricsRecorder so the timing values are emitted
+        once and not held past finalization.
+        """
+        ttfc = self.ttfc_seconds
+        gaps = self.chunk_gap_seconds
+        self.ttfc_seconds = None
+        self.chunk_gap_seconds = []
+        return ttfc, gaps
 
     def _get_metric_token_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}

@@ -254,3 +254,172 @@ async def test_async_chat_completion_metrics(
     assert_all_metric_attributes(
         output_token_usage, latest_experimental_enabled
     )
+
+
+# TTFC and per-output-chunk histograms have a different attribute shape than
+# the duration/token histograms: streaming responses in the recorded cassettes
+# do not include system_fingerprint or service_tier, so we assert only the
+# core gen_ai.* attributes that should always be populated.
+def assert_streaming_metric_attributes(
+    data_point, latest_experimental_enabled, expected_request_model
+):
+    assert GenAIAttributes.GEN_AI_OPERATION_NAME in data_point.attributes
+    assert (
+        data_point.attributes[GenAIAttributes.GEN_AI_OPERATION_NAME]
+        == GenAIAttributes.GenAiOperationNameValues.CHAT.value
+    )
+
+    provider_name_attr_name = (
+        "gen_ai.provider.name"
+        if latest_experimental_enabled
+        else GenAIAttributes.GEN_AI_SYSTEM
+    )
+    assert provider_name_attr_name in data_point.attributes
+    assert (
+        data_point.attributes[provider_name_attr_name]
+        == GenAIAttributes.GenAiSystemValues.OPENAI.value
+    )
+
+    assert GenAIAttributes.GEN_AI_REQUEST_MODEL in data_point.attributes
+    assert (
+        data_point.attributes[GenAIAttributes.GEN_AI_REQUEST_MODEL]
+        == expected_request_model
+    )
+    assert GenAIAttributes.GEN_AI_RESPONSE_MODEL in data_point.attributes
+    assert data_point.attributes[GenAIAttributes.GEN_AI_RESPONSE_MODEL]
+
+    assert (
+        data_point.attributes[ServerAttributes.SERVER_ADDRESS]
+        == "api.openai.com"
+    )
+
+
+def test_chat_completion_streaming_metrics(
+    metric_reader, openai_client, instrument_with_content, vcr
+):
+    """Regression test for the openai_v2 sync chat stream wrapper wiring.
+
+    Exercises the actual ChatStreamWrapper path so that removing
+    timing_target=invocation in chat_wrappers.py would cause this test to
+    fail, not just the util-layer tests.
+    """
+    if not is_experimental_mode():
+        pytest.skip("new stream wrapper only")
+
+    latest_experimental_enabled = is_experimental_mode()
+    request_model = "gpt-4"
+
+    with vcr.use_cassette("test_chat_completion_streaming.yaml"):
+        response = openai_client.chat.completions.create(
+            messages=USER_ONLY_PROMPT,
+            model=request_model,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        for _ in response:
+            pass
+
+    metrics = metric_reader.get_metrics_data().resource_metrics
+    assert len(metrics) == 1
+    metric_data = metrics[0].scope_metrics[0].metrics
+
+    ttfc_metric = next(
+        (
+            m
+            for m in metric_data
+            if m.name == "gen_ai.client.operation.time_to_first_chunk"
+        ),
+        None,
+    )
+    assert ttfc_metric is not None
+    assert len(ttfc_metric.data.data_points) == 1
+    ttfc_point = ttfc_metric.data.data_points[0]
+    assert ttfc_point.count == 1
+    assert ttfc_point.sum >= 0
+    assert_streaming_metric_attributes(
+        ttfc_point, latest_experimental_enabled, request_model
+    )
+
+    chunk_metric = next(
+        (
+            m
+            for m in metric_data
+            if m.name == "gen_ai.client.operation.time_per_output_chunk"
+        ),
+        None,
+    )
+    assert chunk_metric is not None
+    assert len(chunk_metric.data.data_points) == 1
+    chunk_point = chunk_metric.data.data_points[0]
+    assert chunk_point.count >= 1
+    assert chunk_point.sum >= 0
+    assert_streaming_metric_attributes(
+        chunk_point, latest_experimental_enabled, request_model
+    )
+
+
+@pytest.mark.asyncio()
+async def test_async_chat_completion_streaming_metrics(
+    metric_reader, async_openai_client, instrument_with_content, vcr
+):
+    """Regression test for the openai_v2 async chat stream wrapper wiring.
+
+    The async path has separate __init__ wiring from the sync path in
+    chat_wrappers.py, so it needs its own coverage. Removing
+    timing_target=invocation in AsyncChatStreamWrapper would still pass
+    every util-layer test, but would silently break TTFC and per-output-chunk
+    metrics for async OpenAI streaming.
+    """
+    if not is_experimental_mode():
+        pytest.skip("new stream wrapper only")
+
+    latest_experimental_enabled = is_experimental_mode()
+    request_model = "gpt-4"
+
+    with vcr.use_cassette("test_async_chat_completion_streaming.yaml"):
+        response = await async_openai_client.chat.completions.create(
+            messages=USER_ONLY_PROMPT,
+            model=request_model,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        async for _ in response:
+            pass
+
+    metrics = metric_reader.get_metrics_data().resource_metrics
+    assert len(metrics) == 1
+    metric_data = metrics[0].scope_metrics[0].metrics
+
+    ttfc_metric = next(
+        (
+            m
+            for m in metric_data
+            if m.name == "gen_ai.client.operation.time_to_first_chunk"
+        ),
+        None,
+    )
+    assert ttfc_metric is not None
+    assert len(ttfc_metric.data.data_points) == 1
+    ttfc_point = ttfc_metric.data.data_points[0]
+    assert ttfc_point.count == 1
+    assert ttfc_point.sum >= 0
+    assert_streaming_metric_attributes(
+        ttfc_point, latest_experimental_enabled, request_model
+    )
+
+    chunk_metric = next(
+        (
+            m
+            for m in metric_data
+            if m.name == "gen_ai.client.operation.time_per_output_chunk"
+        ),
+        None,
+    )
+    assert chunk_metric is not None
+    assert len(chunk_metric.data.data_points) == 1
+    chunk_point = chunk_metric.data.data_points[0]
+    assert chunk_point.count >= 1
+    assert chunk_point.sum >= 0
+    assert_streaming_metric_attributes(
+        chunk_point, latest_experimental_enabled, request_model
+    )

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import timeit
 from abc import ABCMeta, abstractmethod
 from types import TracebackType
 from typing import (
@@ -28,6 +29,22 @@ else:
 ChunkT = TypeVar("ChunkT")
 _ChunkT_co = TypeVar("_ChunkT_co", covariant=True)
 _logger = logging.getLogger(__name__)
+
+
+class _TimingTarget(Protocol):
+    """Internal protocol for objects that receive streaming timing.
+
+    This is the wrapper-to-invocation seam inside this package and is not
+    a public extension point; third parties should not implement it
+    directly. ``ttfc_seconds`` is set once by the wrapper at
+    finalization. Each inter-chunk gap is pushed through
+    ``_record_chunk_gap`` as soon as it is measured so the wrapper does
+    not need to buffer measurements.
+    """
+
+    ttfc_seconds: float | None
+
+    def _record_chunk_gap(self, gap: float) -> None: ...
 
 
 class _StreamWrapperMeta(ABCMeta, type(_ObjectProxy)):
@@ -64,11 +81,25 @@ class SyncStreamWrapper(
     internally by the wrapper lifecycle and are not part of the public API.
     """
 
-    def __init__(self, stream: _SyncStream[ChunkT]):
+    def __init__(
+        self,
+        stream: _SyncStream[ChunkT],
+        start_time_s: float | None = None,
+        timing_target: _TimingTarget | None = None,
+    ) -> None:
+        if timing_target is not None and start_time_s is None:
+            raise ValueError(
+                "start_time_s is required when timing_target is provided"
+            )
         super().__init__(stream)
         self._self_stream = stream
         self._self_iterator = iter(stream)
         self._self_finalized = False
+        self._self_start_time_s = start_time_s
+        self._self_timing_target = timing_target
+        self._self_ttfc_seconds: float | None = None
+        self._self_first_chunk_at: float | None = None
+        self._self_last_chunk_at: float | None = None
 
     def __enter__(self):
         return self
@@ -116,22 +147,57 @@ class SyncStreamWrapper(
         except Exception as error:
             self._safe_finalize_failure(error)
             raise
+
+        if (
+            self._self_start_time_s is not None
+            or self._self_timing_target is not None
+        ):
+            t_after_read = timeit.default_timer()
+            if self._self_first_chunk_at is None:
+                self._self_first_chunk_at = t_after_read
+                if self._self_start_time_s is not None:
+                    self._self_ttfc_seconds = (
+                        t_after_read - self._self_start_time_s
+                    )
+            else:
+                previous = self._self_last_chunk_at
+                if previous is not None:
+                    self._safe_record_chunk_gap(t_after_read - previous)
+            self._self_last_chunk_at = t_after_read
+
         try:
             self._process_chunk(chunk)
         except Exception as error:  # pylint: disable=broad-exception-caught
             self._handle_process_chunk_error(error)
         return chunk
 
+    def _safe_record_chunk_gap(self, gap: float) -> None:
+        if self._self_timing_target is None:
+            return
+        try:
+            self._self_timing_target._record_chunk_gap(gap)
+        except Exception:  # pylint: disable=broad-exception-caught
+            _logger.debug(
+                "GenAI stream instrumentation error recording chunk gap",
+                exc_info=True,
+            )
+
+    def _sync_timing_to_target(self) -> None:
+        if self._self_timing_target is not None:
+            self._self_timing_target.ttfc_seconds = self._self_ttfc_seconds
+
     def _finalize_success(self) -> None:
         if self._self_finalized:
             return
         self._self_finalized = True
+        self._sync_timing_to_target()
         self._on_stream_end()
 
     def _finalize_failure(self, error: BaseException) -> None:
         if self._self_finalized:
             return
         self._self_finalized = True
+        self._sync_timing_to_target()
         self._on_stream_error(error)
 
     def _safe_finalize_success(self) -> None:
@@ -191,11 +257,25 @@ class AsyncStreamWrapper(
     are owned by this base class.
     """
 
-    def __init__(self, stream: _AsyncStream[ChunkT]):
+    def __init__(
+        self,
+        stream: _AsyncStream[ChunkT],
+        start_time_s: float | None = None,
+        timing_target: _TimingTarget | None = None,
+    ) -> None:
+        if timing_target is not None and start_time_s is None:
+            raise ValueError(
+                "start_time_s is required when timing_target is provided"
+            )
         super().__init__(stream)
         self._self_stream = stream
         self._self_aiter = aiter(stream)
         self._self_finalized = False
+        self._self_start_time_s = start_time_s
+        self._self_timing_target = timing_target
+        self._self_ttfc_seconds: float | None = None
+        self._self_first_chunk_at: float | None = None
+        self._self_last_chunk_at: float | None = None
 
     async def __aenter__(self):
         return self
@@ -245,22 +325,57 @@ class AsyncStreamWrapper(
         except Exception as error:
             self._safe_finalize_failure(error)
             raise
+
+        if (
+            self._self_start_time_s is not None
+            or self._self_timing_target is not None
+        ):
+            t_after_read = timeit.default_timer()
+            if self._self_first_chunk_at is None:
+                self._self_first_chunk_at = t_after_read
+                if self._self_start_time_s is not None:
+                    self._self_ttfc_seconds = (
+                        t_after_read - self._self_start_time_s
+                    )
+            else:
+                previous = self._self_last_chunk_at
+                if previous is not None:
+                    self._safe_record_chunk_gap(t_after_read - previous)
+            self._self_last_chunk_at = t_after_read
+
         try:
             self._process_chunk(chunk)
         except Exception as error:  # pylint: disable=broad-exception-caught
             self._handle_process_chunk_error(error)
         return chunk
 
+    def _safe_record_chunk_gap(self, gap: float) -> None:
+        if self._self_timing_target is None:
+            return
+        try:
+            self._self_timing_target._record_chunk_gap(gap)
+        except Exception:  # pylint: disable=broad-exception-caught
+            _logger.debug(
+                "GenAI stream instrumentation error recording chunk gap",
+                exc_info=True,
+            )
+
+    def _sync_timing_to_target(self) -> None:
+        if self._self_timing_target is not None:
+            self._self_timing_target.ttfc_seconds = self._self_ttfc_seconds
+
     def _finalize_success(self) -> None:
         if self._self_finalized:
             return
         self._self_finalized = True
+        self._sync_timing_to_target()
         self._on_stream_end()
 
     def _finalize_failure(self, error: BaseException) -> None:
         if self._self_finalized:
             return
         self._self_finalized = True
+        self._sync_timing_to_target()
         self._on_stream_error(error)
 
     def _safe_finalize_success(self) -> None:

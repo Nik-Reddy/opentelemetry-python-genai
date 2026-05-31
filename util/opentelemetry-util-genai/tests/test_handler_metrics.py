@@ -393,6 +393,111 @@ class TelemetryHandlerToolMetricsTest(TestBase):
         self.assertAlmostEqual(duration_point.sum, 1.5, places=3)
         self.assertNotIn("gen_ai.client.token.usage", metrics)
 
+    def test_stop_inference_records_ttfc_and_chunk_gaps(self) -> None:
+        """Verify TTFC and time_per_chunk histograms are recorded for streaming."""
+        handler = TelemetryHandler(
+            tracer_provider=self.tracer_provider,
+            meter_provider=self.meter_provider,
+        )
+        with patch("timeit.default_timer", return_value=1000.0):
+            invocation = handler.start_inference("prov", request_model="model")
+
+        # Simulate streaming timing
+        invocation.ttfc_seconds = 0.35
+        invocation.chunk_gap_seconds = [0.05, 0.08, 0.12]
+
+        with patch("timeit.default_timer", return_value=1002.0):
+            invocation.stop()
+
+        # Timing fields are reset after recording so they aren't double-counted
+        self.assertIsNone(invocation.ttfc_seconds)
+        self.assertEqual(invocation.chunk_gap_seconds, [])
+
+        metrics = self._harvest_metrics()
+
+        # TTFC histogram
+        self.assertIn("gen_ai.client.operation.time_to_first_chunk", metrics)
+        ttfc_points = metrics["gen_ai.client.operation.time_to_first_chunk"]
+        self.assertEqual(len(ttfc_points), 1)
+        self.assertAlmostEqual(ttfc_points[0].sum, 0.35, places=3)
+        self.assertEqual(
+            ttfc_points[0].attributes[GenAI.GEN_AI_OPERATION_NAME],
+            GenAI.GenAiOperationNameValues.CHAT.value,
+        )
+        self.assertEqual(
+            ttfc_points[0].attributes[GenAI.GEN_AI_PROVIDER_NAME], "prov"
+        )
+        self.assertEqual(
+            ttfc_points[0].attributes[GenAI.GEN_AI_REQUEST_MODEL], "model"
+        )
+
+        # Time per chunk histogram (one record per gap)
+        self.assertIn("gen_ai.client.operation.time_per_output_chunk", metrics)
+        chunk_points = metrics["gen_ai.client.operation.time_per_output_chunk"]
+        self.assertEqual(len(chunk_points), 1)
+        # Sum of all gaps: 0.05 + 0.08 + 0.12 = 0.25
+        self.assertAlmostEqual(chunk_points[0].sum, 0.25, places=3)
+        # Count should be 3 (one per gap)
+        self.assertEqual(chunk_points[0].count, 3)
+        self.assertEqual(
+            chunk_points[0].attributes[GenAI.GEN_AI_OPERATION_NAME],
+            GenAI.GenAiOperationNameValues.CHAT.value,
+        )
+        self.assertEqual(
+            chunk_points[0].attributes[GenAI.GEN_AI_PROVIDER_NAME], "prov"
+        )
+        self.assertEqual(
+            chunk_points[0].attributes[GenAI.GEN_AI_REQUEST_MODEL], "model"
+        )
+
+    def test_ttfc_span_attribute_recorded(self) -> None:
+        """Verify gen_ai.response.time_to_first_chunk lands on the span."""
+        handler = TelemetryHandler(
+            tracer_provider=self.tracer_provider,
+            meter_provider=self.meter_provider,
+        )
+        with patch("timeit.default_timer", return_value=1000.0):
+            invocation = handler.start_inference("prov", request_model="model")
+
+        invocation.ttfc_seconds = 0.42
+
+        with patch("timeit.default_timer", return_value=1002.0):
+            invocation.stop()
+
+        spans = self.get_finished_spans()
+        self.assertEqual(len(spans), 1)
+        attrs = spans[0].attributes
+        self.assertIn("gen_ai.response.time_to_first_chunk", attrs)
+        self.assertAlmostEqual(
+            attrs["gen_ai.response.time_to_first_chunk"], 0.42, places=3
+        )
+
+    def test_no_ttfc_recorded_for_non_streaming(self) -> None:
+        """Non-streaming calls should not emit TTFC or chunk metrics."""
+        handler = TelemetryHandler(
+            tracer_provider=self.tracer_provider,
+            meter_provider=self.meter_provider,
+        )
+        with patch("timeit.default_timer", return_value=1000.0):
+            invocation = handler.start_inference("prov", request_model="model")
+        invocation.input_tokens = 10
+        invocation.output_tokens = 20
+
+        with patch("timeit.default_timer", return_value=1001.0):
+            invocation.stop()
+
+        metrics = self._harvest_metrics()
+        # Duration and tokens should exist
+        self.assertIn("gen_ai.client.operation.duration", metrics)
+        self.assertIn("gen_ai.client.token.usage", metrics)
+        # TTFC and chunk metrics should NOT exist (no data points)
+        self.assertNotIn(
+            "gen_ai.client.operation.time_to_first_chunk", metrics
+        )
+        self.assertNotIn(
+            "gen_ai.client.operation.time_per_output_chunk", metrics
+        )
+
 
 class TelemetryHandlerRetrievalMetricsTest(TestBase):
     def _harvest_metrics(self) -> Dict[str, List[Any]]:

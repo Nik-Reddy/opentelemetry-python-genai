@@ -182,7 +182,11 @@ class ChatStreamWrapper(
         invocation: InferenceInvocation,
         capture_content: bool,
     ) -> None:
-        super().__init__(stream)
+        super().__init__(
+            stream,
+            start_time_s=invocation.monotonic_start_s,
+            timing_target=invocation,
+        )
         self._self_invocation = invocation
         self._self_choice_buffers = []
         self._self_capture_content = capture_content
@@ -203,7 +207,11 @@ class AsyncChatStreamWrapper(
         invocation: InferenceInvocation,
         capture_content: bool,
     ) -> None:
-        super().__init__(stream)
+        super().__init__(
+            stream,
+            start_time_s=invocation.monotonic_start_s,
+            timing_target=invocation,
+        )
         self._self_invocation = invocation
         self._self_choice_buffers = []
         self._self_capture_content = capture_content

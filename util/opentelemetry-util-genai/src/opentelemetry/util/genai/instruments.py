@@ -4,6 +4,14 @@
 from opentelemetry.metrics import Histogram, Meter
 from opentelemetry.semconv._incubating.metrics import gen_ai_metrics
 
+# TODO: Migrate to GenAI constants once available in semconv package
+_GEN_AI_CLIENT_OPERATION_TIME_TO_FIRST_CHUNK = (
+    "gen_ai.client.operation.time_to_first_chunk"
+)
+_GEN_AI_CLIENT_OPERATION_TIME_PER_OUTPUT_CHUNK = (
+    "gen_ai.client.operation.time_per_output_chunk"
+)
+
 _GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS = [
     0.01,
     0.02,
@@ -54,4 +62,30 @@ def create_token_histogram(meter: Meter) -> Histogram:
         description="Number of input and output tokens used by GenAI clients",
         unit="{token}",
         explicit_bucket_boundaries_advisory=_GEN_AI_CLIENT_TOKEN_USAGE_BUCKETS,
+    )
+
+
+def create_ttfc_histogram(meter: Meter) -> Histogram:
+    return meter.create_histogram(
+        name=_GEN_AI_CLIENT_OPERATION_TIME_TO_FIRST_CHUNK,
+        description=(
+            "Time to receive the first chunk, measured from when the client "
+            "issues the generation request to when the first chunk is "
+            "received in the response stream."
+        ),
+        unit="s",
+        explicit_bucket_boundaries_advisory=_GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS,
+    )
+
+
+def create_time_per_chunk_histogram(meter: Meter) -> Histogram:
+    return meter.create_histogram(
+        name=_GEN_AI_CLIENT_OPERATION_TIME_PER_OUTPUT_CHUNK,
+        description=(
+            "Time per output chunk, recorded for each chunk received after "
+            "the first one, measured as the time elapsed from the end of "
+            "the previous chunk to the end of the current chunk."
+        ),
+        unit="s",
+        explicit_bucket_boundaries_advisory=_GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS,
     )

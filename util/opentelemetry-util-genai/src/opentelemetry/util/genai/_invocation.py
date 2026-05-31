@@ -85,6 +85,17 @@ class GenAIInvocation(AbstractContextManager["GenAIInvocation"]):
         self._context_token: ContextToken | None = None
         self._monotonic_start_s: float | None = None
 
+    @property
+    def monotonic_start_s(self) -> float | None:
+        """Monotonic timestamp (seconds) when this invocation started.
+
+        This timestamp is the anchor for the streaming time-to-first-chunk
+        (TTFC) metric. Instrumentations MUST NOT perform meaningful work
+        between ``start_inference()`` and the wrapped SDK call: anything
+        heavier than building attribute dicts will silently inflate TTFC.
+        """
+        return self._monotonic_start_s
+
     def _start(self, attributes: dict[str, Any] | None = None) -> None:
         """Start the invocation span and attach it to the current context.
 

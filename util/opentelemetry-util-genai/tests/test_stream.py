@@ -5,6 +5,7 @@
 
 import asyncio
 import inspect
+from unittest.mock import patch
 
 import pytest
 
@@ -540,3 +541,219 @@ def test_async_stream_wrapper_swallows_process_chunk_errors():
         assert not wrapper._self_failures
 
     asyncio.run(exercise())
+
+
+# --- Timing measurement tests ---
+
+
+def test_sync_stream_wrapper_records_ttfc():
+    """TTFC is computed from start_time_s to first chunk arrival."""
+
+    stream = _FakeSyncStream(chunks=["a", "b", "c"])
+    wrapper = _TestSyncStreamWrapper.__new__(_TestSyncStreamWrapper)
+    SyncStreamWrapper.__init__(wrapper, stream, start_time_s=99.0)
+    wrapper._self_processed = []
+    wrapper._self_stop_count = 0
+    wrapper._self_failures = []
+
+    # Iterate with controlled time. Only after-read timestamps are
+    # consumed now that the wrapper no longer measures blocking-read time.
+    read_times = iter([101.2, 101.8, 102.1])
+    with patch("timeit.default_timer", side_effect=read_times):
+        chunks = list(wrapper)
+
+    assert chunks == ["a", "b", "c"]
+    # TTFC = first chunk after_read (101.2) - start_time_s (99.0) = 2.2
+    assert wrapper._self_ttfc_seconds == pytest.approx(2.2)
+    # Inter-chunk gaps: 101.8 - 101.2 = 0.6, 102.1 - 101.8 = 0.3
+    assert wrapper._self_last_chunk_at == pytest.approx(102.1)
+
+
+def test_sync_stream_wrapper_no_ttfc_without_start_time():
+    """Without start_time_s, TTFC stays None."""
+    stream = _FakeSyncStream(chunks=["a", "b"])
+    wrapper = _TestSyncStreamWrapper(stream)
+
+    list(wrapper)
+
+    assert wrapper._self_ttfc_seconds is None
+    # With timing disabled (no start_time_s, no timing_target), all
+    # timing state stays None; the chunk-arrival timer is not invoked.
+    assert wrapper._self_last_chunk_at is None
+
+
+def test_sync_stream_wrapper_single_chunk_no_gaps():
+    """Single-chunk stream has TTFC but no gaps."""
+
+    stream = _FakeSyncStream(chunks=["only"])
+    wrapper = _TestSyncStreamWrapper.__new__(_TestSyncStreamWrapper)
+    SyncStreamWrapper.__init__(wrapper, stream, start_time_s=50.0)
+    wrapper._self_processed = []
+    wrapper._self_stop_count = 0
+    wrapper._self_failures = []
+
+    read_times = iter([60.5])
+    with patch("timeit.default_timer", side_effect=read_times):
+        chunks = list(wrapper)
+
+    assert chunks == ["only"]
+    assert wrapper._self_ttfc_seconds == pytest.approx(10.5)  # 60.5 - 50.0
+    # First chunk records arrival time but emits no gap.
+    assert wrapper._self_last_chunk_at == pytest.approx(60.5)
+
+
+def test_sync_stream_wrapper_error_before_first_chunk_no_ttfc():
+    """If stream errors before first chunk, no TTFC is recorded."""
+    stream = _FakeSyncStream(error=RuntimeError("network"))
+    wrapper = _TestSyncStreamWrapper.__new__(_TestSyncStreamWrapper)
+    SyncStreamWrapper.__init__(wrapper, stream, start_time_s=10.0)
+    wrapper._self_processed = []
+    wrapper._self_stop_count = 0
+    wrapper._self_failures = []
+
+    with pytest.raises(RuntimeError, match="network"):
+        next(wrapper)
+
+    assert wrapper._self_ttfc_seconds is None
+    assert wrapper._self_last_chunk_at is None
+
+
+def test_async_stream_wrapper_records_ttfc():
+    """Async wrapper records TTFC and chunk gaps."""
+
+    async def exercise():
+        stream = _FakeAsyncStream(chunks=["x", "y", "z"])
+        wrapper = _TestAsyncStreamWrapper.__new__(_TestAsyncStreamWrapper)
+        AsyncStreamWrapper.__init__(wrapper, stream, start_time_s=200.0)
+        wrapper._self_processed = []
+        wrapper._self_stop_count = 0
+        wrapper._self_failures = []
+
+        read_times = iter([201.3, 202.0, 202.2])
+        with patch("timeit.default_timer", side_effect=read_times):
+            chunks = []
+            async for chunk in wrapper:
+                chunks.append(chunk)
+
+        assert chunks == ["x", "y", "z"]
+        assert wrapper._self_ttfc_seconds == pytest.approx(
+            1.3
+        )  # 201.3 - 200.0
+        # Inter-chunk gaps: 202.0 - 201.3 = 0.7, 202.2 - 202.0 = 0.2
+        assert wrapper._self_last_chunk_at == pytest.approx(202.2)
+
+    asyncio.run(exercise())
+
+
+# --- timing_target sync tests ---
+
+
+class _FakeTimingTarget:
+    def __init__(self):
+        self.ttfc_seconds = None
+        self.chunk_gap_seconds = []
+
+    def _record_chunk_gap(self, gap):
+        self.chunk_gap_seconds.append(gap)
+
+
+class _TimingTargetSyncWrapper(SyncStreamWrapper):
+    def __init__(self, stream, **kwargs):
+        super().__init__(stream, **kwargs)
+        self._self_processed = []
+        self._self_end_target_ttfc = None
+
+    def _process_chunk(self, chunk):
+        self._self_processed.append(chunk)
+
+    def _on_stream_end(self):
+        if self._self_timing_target is not None:
+            self._self_end_target_ttfc = self._self_timing_target.ttfc_seconds
+
+    def _on_stream_error(self, error):
+        if self._self_timing_target is not None:
+            self._self_end_target_ttfc = self._self_timing_target.ttfc_seconds
+
+
+def test_timing_target_receives_values_on_success():
+    mock_patch = patch
+
+    target = _FakeTimingTarget()
+    stream = _FakeSyncStream(chunks=["a", "b", "c"])
+    wrapper = _TimingTargetSyncWrapper(
+        stream, start_time_s=100.0, timing_target=target
+    )
+
+    times = iter([100.5, 101.0, 101.3])
+    with mock_patch("timeit.default_timer", side_effect=times):
+        for _ in wrapper:
+            pass
+
+    assert target.ttfc_seconds == pytest.approx(0.5)
+    # Inter-chunk gaps: 101.0 - 100.5 = 0.5, 101.3 - 101.0 = 0.3
+    assert target.chunk_gap_seconds == pytest.approx([0.5, 0.3])
+
+
+def test_timing_target_without_start_time_raises():
+    """timing_target without start_time_s is a misconfiguration: TTFC has no
+    meaning without a start, so the constructor surfaces it loudly rather than
+    silently emitting no TTFC."""
+    target = _FakeTimingTarget()
+    stream = _FakeSyncStream(chunks=["a"])
+    with pytest.raises(ValueError, match="start_time_s is required"):
+        _TimingTargetSyncWrapper(stream, timing_target=target)
+
+
+def test_async_timing_target_without_start_time_raises():
+    target = _FakeTimingTarget()
+    stream = _FakeAsyncStream(chunks=["a"])
+    wrapper = _TestAsyncStreamWrapper.__new__(_TestAsyncStreamWrapper)
+    with pytest.raises(ValueError, match="start_time_s is required"):
+        AsyncStreamWrapper.__init__(wrapper, stream, timing_target=target)
+
+
+def test_timing_target_populated_before_on_stream_end():
+    mock_patch = patch
+
+    target = _FakeTimingTarget()
+    stream = _FakeSyncStream(chunks=["x"])
+    wrapper = _TimingTargetSyncWrapper(
+        stream, start_time_s=50.0, timing_target=target
+    )
+
+    times = iter([50.2])
+    with mock_patch("timeit.default_timer", side_effect=times):
+        for _ in wrapper:
+            pass
+
+    # Hook captured target.ttfc_seconds when _on_stream_end ran
+    assert wrapper._self_end_target_ttfc == pytest.approx(0.2)
+
+
+def test_timing_target_populated_before_on_stream_error():
+    mock_patch = patch
+
+    target = _FakeTimingTarget()
+    error = RuntimeError("fail")
+    stream = _FakeSyncStream(chunks=["x"], error=error)
+    wrapper = _TimingTargetSyncWrapper(
+        stream, start_time_s=50.0, timing_target=target
+    )
+
+    times = iter([50.2])
+    with mock_patch("timeit.default_timer", side_effect=times):
+        with pytest.raises(RuntimeError):
+            for _ in wrapper:
+                pass
+
+    assert wrapper._self_end_target_ttfc == pytest.approx(0.2)
+
+
+def test_no_timing_target_still_works():
+    stream = _FakeSyncStream(chunks=["a", "b"])
+    wrapper = _TimingTargetSyncWrapper(stream, start_time_s=10.0)
+
+    for _ in wrapper:
+        pass
+
+    assert wrapper._self_ttfc_seconds is not None

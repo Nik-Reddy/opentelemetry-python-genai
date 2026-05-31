@@ -1,0 +1,1 @@
+Record streaming `gen_ai.client.operation.time_to_first_chunk` and `gen_ai.client.operation.time_per_output_chunk` histograms on inference invocations, and expose a `_TimingTarget` protocol on the shared stream wrappers so per-chunk gaps are pushed inline rather than buffered in the wrapper.
