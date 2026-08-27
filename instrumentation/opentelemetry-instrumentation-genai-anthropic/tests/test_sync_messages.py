@@ -8,12 +8,21 @@ import inspect
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
-import httpx
 import pytest
+
+try:
+    import httpx
+except ImportError:
+    import httpx2 as httpx
 from anthropic import Anthropic, APIConnectionError, NotFoundError
-from anthropic._legacy_response import LegacyAPIResponse
-from anthropic._response import APIResponse
+from anthropic._response import APIResponse, ResponseContextManager
+
+try:
+    from anthropic._legacy_response import LegacyAPIResponse
+except ImportError:
+    from anthropic._response import APIResponse as LegacyAPIResponse
 from anthropic._streaming import Stream as AnthropicStream
 from anthropic.resources.messages import Messages as _Messages
 from anthropic.types import (
@@ -33,6 +42,7 @@ from opentelemetry.instrumentation.genai.anthropic._raw_response import (
 from opentelemetry.instrumentation.genai.anthropic.messages_extractors import (
     GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
     GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+    get_server_address_and_port,
 )
 from opentelemetry.semconv._incubating.attributes import (
     error_attributes as ErrorAttributes,
@@ -50,6 +60,25 @@ from opentelemetry.semconv._incubating.metrics import gen_ai_metrics
 _create_params = set(inspect.signature(_Messages.create).parameters)
 _has_tools_param = "tools" in _create_params
 _has_thinking_param = "thinking" in _create_params
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        (None, (None, None)),
+        ("https://api.anthropic.com:443", ("api.anthropic.com", None)),
+        ("http://localhost:80", ("localhost", None)),
+        ("https://collector.example:4318", ("collector.example", 4318)),
+        (
+            SimpleNamespace(host="custom.anthropic.test", port=8443),
+            ("custom.anthropic.test", 8443),
+        ),
+    ],
+)
+def test_get_server_address_and_port(base_url, expected):
+    client = SimpleNamespace(_client=SimpleNamespace(base_url=base_url))
+
+    assert get_server_address_and_port(client) == expected
 
 
 def normalize_stop_reason(stop_reason):
@@ -236,12 +265,15 @@ def test_sync_messages_streaming_response_is_transparent(
     span_exporter, anthropic_client, instrument_no_content
 ):
     """The streaming proxy must also keep the SDK's type and its parsed stream."""
-    with anthropic_client.messages.with_streaming_response.create(
+    context_manager = anthropic_client.messages.with_streaming_response.create(
         model="claude-sonnet-4-20250514",
         max_tokens=100,
         messages=[{"role": "user", "content": "Say hello in one word."}],
         stream=True,
-    ) as raw_response:
+    )
+    assert isinstance(context_manager, ResponseContextManager)
+    assert context_manager.__class__ is ResponseContextManager
+    with context_manager as raw_response:
         assert isinstance(raw_response, APIResponse)
         assert raw_response.__class__ is APIResponse
         stream = raw_response.parse()
@@ -404,15 +436,19 @@ def test_sync_messages_create_with_all_params(
     model = "claude-sonnet-4-20250514"
     messages = [{"role": "user", "content": "Say hello."}]
 
-    anthropic_client.messages.create(
-        model=model,
-        max_tokens=50,
-        messages=messages,
-        temperature=0.7,
-        top_p=0.9,
-        top_k=40,
-        stop_sequences=["STOP"],
-    )
+    kwargs = {
+        "model": model,
+        "max_tokens": 50,
+        "messages": messages,
+        "stop_sequences": ["STOP"],
+    }
+    sampling_params = {"temperature": 0.7, "top_p": 0.9, "top_k": 40}
+    if "temperature" in _create_params:
+        kwargs.update(sampling_params)
+    else:
+        kwargs["extra_body"] = sampling_params
+
+    anthropic_client.messages.create(**kwargs)
 
     spans = span_exporter.get_finished_spans()
     assert len(spans) == 1
@@ -550,6 +586,40 @@ def test_uninstrument_removes_patching(
     # but we can verify no spans are created for a mocked scenario
     # For this test, we'll just verify uninstrument doesn't raise
     assert True
+
+
+def test_sync_streaming_response_type_survives_instrumentation_round_trip(
+    tracer_provider, logger_provider, meter_provider
+):
+    """Instrumenting and uninstrumenting keeps the SDK manager type intact."""
+    instrumentor = AnthropicInstrumentor()
+    client = Anthropic()
+
+    def create_context_manager():
+        return client.messages.with_streaming_response.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=100,
+            messages=[{"role": "user", "content": "Hello"}],
+            stream=True,
+        )
+
+    instrumentor.instrument(
+        tracer_provider=tracer_provider,
+        logger_provider=logger_provider,
+        meter_provider=meter_provider,
+    )
+    try:
+        assert create_context_manager().__class__ is ResponseContextManager
+        instrumentor.uninstrument()
+        assert create_context_manager().__class__ is ResponseContextManager
+        instrumentor.instrument(
+            tracer_provider=tracer_provider,
+            logger_provider=logger_provider,
+            meter_provider=meter_provider,
+        )
+        assert create_context_manager().__class__ is ResponseContextManager
+    finally:
+        instrumentor.uninstrument()
 
 
 def test_multiple_instrument_uninstrument_cycles(
@@ -1773,14 +1843,6 @@ def test_sync_messages_raw_response_stream_wrap_failure_not_raised(
     assert len(span_exporter.get_finished_spans()) == 1
 
 
-@pytest.mark.skip(
-    reason="Known gap, tracked in #389: the SDK's "
-    "ResponseContextManager.__exit__ discards the caller's exception before "
-    "closing the response, so the proxy never sees it and the span is "
-    "finalized as a success. Fixing it means instrumenting "
-    "MessagesWithStreamingResponse.create and wrapping the context manager "
-    "itself, which is a new patch target and out of scope here."
-)
 @pytest.mark.vcr()
 @pytest.mark.cassette("test_sync_messages_create_streaming_with_raw_response")
 def test_sync_messages_with_streaming_response_user_exception(
@@ -1809,6 +1871,89 @@ def test_sync_messages_with_streaming_response_user_exception(
     span = spans[0]
     assert span.attributes[GenAIAttributes.GEN_AI_REQUEST_MODEL] == model
     assert span.attributes[ErrorAttributes.ERROR_TYPE] == "ValueError"
+
+
+@pytest.mark.vcr()
+@pytest.mark.cassette("test_sync_messages_create_streaming_with_raw_response")
+def test_sync_messages_with_streaming_response_user_exception_before_parse(
+    span_exporter, anthropic_client, instrument_no_content
+):
+    """A caller error before parsing still fails the raw-response span once."""
+    with pytest.raises(ValueError, match="User raised exception"):
+        with anthropic_client.messages.with_streaming_response.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=100,
+            messages=[{"role": "user", "content": "Say hello in one word."}],
+            stream=True,
+        ):
+            raise ValueError("User raised exception")
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].attributes[ErrorAttributes.ERROR_TYPE] == "ValueError"
+
+
+@pytest.mark.vcr()
+@pytest.mark.cassette("test_sync_messages_create_streaming_with_raw_response")
+def test_sync_messages_with_streaming_response_user_exception_after_drain(
+    span_exporter, anthropic_client, instrument_no_content
+):
+    """A caller error after draining does not finalize the span twice."""
+    with pytest.raises(ValueError, match="User raised exception"):
+        with anthropic_client.messages.with_streaming_response.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=100,
+            messages=[{"role": "user", "content": "Say hello in one word."}],
+            stream=True,
+        ) as raw_response:
+            list(raw_response.parse())
+            raise ValueError("User raised exception")
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert ErrorAttributes.ERROR_TYPE not in spans[0].attributes
+
+
+@pytest.mark.vcr()
+@pytest.mark.cassette("test_sync_messages_create_with_raw_response")
+def test_sync_messages_with_streaming_response_nonstreaming_user_exception(
+    span_exporter, anthropic_client, instrument_no_content
+):
+    """A caller error in a non-streaming response context fails the span."""
+    model = "claude-sonnet-4-20250514"
+
+    with pytest.raises(ValueError, match="User raised exception"):
+        with anthropic_client.messages.with_streaming_response.create(
+            model=model,
+            max_tokens=100,
+            messages=[{"role": "user", "content": "Say hello in one word."}],
+        ):
+            raise ValueError("User raised exception")
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].attributes[ErrorAttributes.ERROR_TYPE] == "ValueError"
+
+
+@pytest.mark.vcr()
+@pytest.mark.cassette("test_sync_messages_create_with_raw_response")
+def test_sync_messages_with_raw_response_caller_exception(
+    span_exporter, anthropic_client, instrument_no_content
+):
+    """A caller error while handling a raw response is separate from the call."""
+    raw_response = anthropic_client.messages.with_raw_response.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=100,
+        messages=[{"role": "user", "content": "Say hello in one word."}],
+    )
+
+    with pytest.raises(ValueError, match="User raised exception"):
+        raise ValueError("User raised exception")
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert ErrorAttributes.ERROR_TYPE not in spans[0].attributes
+    assert raw_response.headers is not None
 
 
 @pytest.mark.vcr()
