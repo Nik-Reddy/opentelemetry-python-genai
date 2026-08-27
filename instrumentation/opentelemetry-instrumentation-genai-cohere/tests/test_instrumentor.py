@@ -22,7 +22,7 @@ def test_instrumentation_dependencies():
 
     assert dependencies is not None
     assert len(dependencies) > 0
-    assert "cohere >= 5.13.0" in dependencies
+    assert "cohere >= 5.13.0, < 8" in dependencies
 
 
 def test_instrument_uninstrument_cycle(
